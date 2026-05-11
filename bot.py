@@ -32,10 +32,15 @@ from issue_store import (
 )
 from ai_handler import classify_message, classify_issue_status, find_duplicate
 
-# How many hours old an issue can be before it is deprioritised
-# in sender-based matching (Branch B, Tier 2 soft matching).
-# Issues older than this are still considered if there is a hard entity match.
 RECENCY_HOURS = 24
+
+# Keywords that signal a network/ops incident
+INCIDENT_KEYWORDS = [
+    "fail", "failed", "failing", "down", "outage", "error", "issue",
+    "not working", "unreachable", "timeout", "drain", "tunnel", "ospf",
+    "bgp", "ebgp", "cost", "normalise", "normalized", "check", "review",
+    "trigger", "triggered", "alert", "incident", "inc", "ticket",
+]
 
 
 class LocalTokenProvider(AnonymousTokenProvider):
@@ -116,6 +121,12 @@ def extract_ticket_id(text: str) -> str | None:
     return None
 
 
+def extract_all_ticket_ids(text: str) -> list[str]:
+    """Extract ALL ticket IDs from a message, not just the first one."""
+    matches = re.findall(r"\b(inc[- ]?\d+)\b", text.lower())
+    return [m.replace(" ", "").replace("-", "").upper() for m in matches]
+
+
 def extract_device_name(text: str) -> str | None:
     """Extract device identifiers — uppercase alphanumeric, 8+ chars."""
     m = re.search(r"\b([A-Z]{2,}[A-Z0-9]{6,})\b", text)
@@ -140,6 +151,42 @@ def extract_issue_reference(text: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def has_incident_signals(text: str) -> bool:
+    """
+    Pre-classification noise filter — replaces the old 'other' category.
+
+    Returns True if the message contains at least one hard incident signal:
+    - A ticket ID (INC12345)
+    - A device name (RTCEEUZ22225B)
+    - A known incident keyword
+
+    Returns False for pure noise (greetings, thanks, questions with no
+    incident context) so they are dropped before the LLM is even called.
+
+    Examples that return False (dropped):
+      "Hi team", "Thanks!", "Good morning", "👍", "Okay noted"
+
+    Examples that return True (processed):
+      "Hi team please review INC25067637"   ← ticket ID
+      "OSPF fail on RTCEEUZ22225B"          ← device name + keyword
+      "drain failed"                        ← keyword
+      "tunnel is back up"                   ← keyword
+    """
+    # Hard signals — ticket ID or device name always wins
+    if extract_all_ticket_ids(text):
+        return True
+    if extract_device_name(text):
+        return True
+
+    # Soft signals — known incident keywords
+    lower = text.lower()
+    for keyword in INCIDENT_KEYWORDS:
+        if keyword in lower:
+            return True
+
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Branch B: shortlist candidate issues for a no-reply_to_id message
 # ---------------------------------------------------------------------------
@@ -156,13 +203,6 @@ def shortlist_candidate_issues(text: str, sender: str) -> dict:
     3. Tier 2 — soft match (most recent issue by sender within RECENCY_HOURS):
        - Only if no hard entity match
     4. No match → return None (treat as new issue)
-
-    Returns:
-    {
-        "issue": <issue dict> | None,
-        "match_type": "entity" | "recency" | None,
-        "reason": "explanation"
-    }
     """
     sender_issues = get_open_issues_by_sender(sender)
 
@@ -189,7 +229,7 @@ def shortlist_candidate_issues(text: str, sender: str) -> dict:
             }
 
     # Tier 2: soft match — most recent issue by sender within recency window
-    most_recent = sender_issues[0]  # already sorted most recent first
+    most_recent = sender_issues[0]
     age_hours = hours_since(most_recent["created_at"])
 
     if age_hours <= RECENCY_HOURS:
@@ -215,17 +255,14 @@ async def _apply_status(context: TurnContext, issue: dict, text: str, sender: st
     Append the new message to the issue thread, then ask the LLM whether
     the issue is resolved or still open. Act accordingly.
     """
-    # Append the new message first so the LLM sees the full picture
     updated_issue = append_issue_comment(issue["id"], text, author=sender)
     if not updated_issue:
         return
 
-    # Link this activity to the issue for future reply threading
     activity_id = get_activity_id(context)
     if activity_id:
         link_activity_to_issue(activity_id, issue["id"])
 
-    # Build full thread and ask LLM
     thread = get_full_thread(updated_issue)
     try:
         result = await classify_issue_status(thread)
@@ -245,7 +282,6 @@ async def _apply_status(context: TurnContext, issue: dict, text: str, sender: st
                 f"Use `/resolved` to see all resolved issues."
             )
     else:
-        # Still open — comment already appended above, just notify
         await context.send_activity(
             f"📝 **Issue #{updated_issue['id']}** updated, still open.\n"
             f"**Update:** {note}\n\n"
@@ -361,7 +397,15 @@ async def on_message(context: TurnContext, _: TurnState):
     activity_id = get_activity_id(context)
     reply_to_id = get_reply_to_id(context)
 
-    # Classify the intent of the message (issue / update / other)
+    # ----------------------------------------------------------------
+    # Pre-classification noise filter (replaces "other" category)
+    # Drop the message early if it has zero incident signals.
+    # This avoids calling the LLM for greetings, thanks, and noise.
+    # ----------------------------------------------------------------
+    if not reply_to_id and not has_incident_signals(text):
+        return   # pure noise — silently ignore
+
+    # Classify the intent of the message (issue / update only — no "other")
     try:
         classification = await classify_message(text)
     except Exception as e:
@@ -370,8 +414,6 @@ async def on_message(context: TurnContext, _: TurnState):
 
     # ----------------------------------------------------------------
     # Branch A: message is a Teams reply (reply_to_id is known)
-    # This is definitely a follow-up to an existing issue.
-    # Append to the thread and let the LLM decide resolved or open.
     # ----------------------------------------------------------------
     if reply_to_id:
         linked_issue = (
@@ -383,20 +425,13 @@ async def on_message(context: TurnContext, _: TurnState):
             await _apply_status(context, linked_issue, text, sender)
             return
 
-        # reply_to_id known but no linked issue found — fall through to Branch B
-
     # ----------------------------------------------------------------
     # Branch B: no reply_to_id (or reply not linked to a known issue)
-    # Determine if this is a follow-up or a new issue.
     # ----------------------------------------------------------------
-
-    # If LLM says this is noise, do nothing
-    if classification["type"] == "other":
-        return
 
     description = classification.get("description") or text
 
-    # Step 1: explicit "issue #N" reference — direct link, no ambiguity
+    # Step 1: explicit "issue #N" reference
     referenced_issue_id = extract_issue_reference(text)
     if referenced_issue_id is not None:
         referenced_issue = get_issue_by_id(referenced_issue_id)
@@ -408,25 +443,18 @@ async def on_message(context: TurnContext, _: TurnState):
     candidate = shortlist_candidate_issues(text, sender)
 
     if candidate["issue"] is not None:
-        # We have a confident match — treat as follow-up
-        matched_issue = candidate["issue"]
-
-        # If message type is "issue" but we found a candidate, it could be
-        # a new symptom on the same underlying incident — still treat as follow-up
-        # since entity/recency match is a stronger signal than LLM classification
-        await _apply_status(context, matched_issue, text, sender)
+        await _apply_status(context, candidate["issue"], text, sender)
         return
 
-    # Step 3: no candidate match — check for duplicates before creating new issue
+    # Step 3: no candidate match
     if classification["type"] == "update":
-        # LLM thinks it's an update but we couldn't match it to any issue
         await context.send_activity(
             "I detected a possible update but couldn't confidently match it to an open issue. "
             "If this relates to an existing issue, please reply directly to that message."
         )
         return
 
-    # classification["type"] == "issue" with no candidate match
+    # Step 4: duplicate check before creating new issue
     open_issues = get_open_issues()
     try:
         dup = await find_duplicate(description, open_issues)

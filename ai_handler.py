@@ -72,12 +72,16 @@ async def _call_openai(prompt: str) -> str:
 async def classify_message(text: str) -> dict:
     """
     Classify an incoming message as:
-    - "issue"      → a new problem being reported
-    - "update"     → a follow-up, resolution, or status update on an existing issue
-    - "other"      → greeting, question, delegation, noise
+    - "issue"  → a new problem being reported
+    - "update" → a follow-up, resolution, or status update on an existing issue
 
-    This is only used to decide the high-level intent of the message.
-    The actual resolved/open decision is made separately by classify_issue_status.
+    "other" has been removed. Noise filtering is handled upstream by
+    has_incident_signals() in agent.py before this function is called.
+
+    IMPORTANT: The presence of a ticket ID (e.g. INC25177727) or device name
+    always takes priority over the tone or phrasing of the message.
+    A message that opens with a greeting or delegation phrase but contains
+    incident identifiers must still be classified as "issue" or "update".
     """
     prompt = f"""Analyze this Teams chat message and classify its intent.
 
@@ -85,29 +89,31 @@ Message: "{text}"
 
 Respond ONLY with a JSON object, no markdown, no explanation:
 {{
-  "type": "issue" | "update" | "other",
-  "description": "concise one-line summary of the issue or update, or null if other"
+  "type": "issue" | "update",
+  "description": "concise one-line summary of the issue or update"
 }}
 
 Rules:
-- "issue" = a new problem being reported for the first time
+- "issue" = a new problem being reported, even if phrased as a request to check or review
 - "update" = any follow-up, status update, resolution, or comment about an existing problem
-- "other" = greetings, questions with no problem being reported, delegation, noise
+- IMPORTANT: If a ticket ID (e.g. INC25177727) or device name is present, ALWAYS classify
+  as "issue" or "update" — never let the opening phrase override this signal
+- If the message mentions a ticket ID alongside a problem description, classify as "issue"
+- If the message mentions a ticket ID alongside a resolution or status, classify as "update"
 
 Examples of "issue":
 - "INC25177727 traffic drain failed on RTCEEUZ22225B"
 - "SH not triggering on device RTDPUS16390A"
+- "Hi team please review INC25067637"
+- "Jong, Yansen kindly check INC12345 OSPF cost 2000 tunnel299 costed up"
+- "please check ticket INC25177727, drain failed"
 
 Examples of "update":
 - "Just checked, still not working"
 - "INC25199999 has been fixed, tunnel is back up"
 - "We're looking into it"
 - "drain should have still went in, just need to check the script output"
-
-Examples of "other":
-- "Can you please check this?" (delegation)
-- "Any error in specific?" (question)
-- "Hi team" (greeting)
+- "INC12345 normalised successfully"
 """
     raw = await _call_openai(prompt)
     try:
@@ -116,7 +122,8 @@ Examples of "other":
     except Exception as e:
         print("classify_message parse failed:", e)
         print("raw response:", raw)
-        return {"type": "other", "description": None}
+        # Safe fallback — treat as issue so it's not silently dropped
+        return {"type": "issue", "description": text}
 
 
 async def classify_issue_status(thread: str) -> dict:
